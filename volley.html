@@ -1,0 +1,291 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <meta name="Keywords" content="blog"/>
+    <meta name="Description" content="blog"/>
+    <title>Simple</title>
+    <link rel="shortcut icon" href="/static/favicon.png"/>
+    <link rel="stylesheet" type="text/css" href="/main.css" />
+</head>
+<body>
+<div class="main">
+    <div class="header">
+    	<ul id="pages">
+            <li><a href="/">home</a></li>
+            <li><a href="/#/tags">tags</a></li>
+            <li><a href="/#/archive">archive</a></li>
+    	</ul>
+    </div>
+	<div class="wrap-header">
+	<h1>
+    <a href="/" id="title"></a>
+	</h1>
+	</div>
+<div id="md" style="display: none;">
+<!-- markdown -->
+volley基本构成图
+![volley constructor](http://7xvhgu.com1.z0.glb.clouddn.com/android/image/volley%20constructor.png)
+
+volley请求流程图
+![request sequence](http://7xvhgu.com1.z0.glb.clouddn.com/android/image/request%20sequence.png)
+
+###**不同于其它volley的分析,我对于volley的分析不是分模块的,而是根据一个请求具体的处理过程来看整个volley的,在读源码时也是采用这种方法,效果也比较好.**
+
+##Volley类
+Volley类可以看做是一个工厂类,在其中产出一个符合要求的请求队列,并准备一些基础设施,具体的步骤如下:
+1. 指定缓存目录,默认使用内部存储中的volley文件夹
+2. 指定useragent(包名/版本号),HttpUrlConnection这种请求api使用内置useragent
+3. 指定网络请求使用的基础类库 2.3以下使用HttpClient,2.3及以上使用HttpUrlConnection
+4. 指定请求处理流程类:BasicNetwork
+5. 创建请求队列相关(Cache,Network)
+6. 开始处理
+
+##RequestQueue类
+在Volley创建好RequestQueue后,就由RequestQueue处理具体请求.
+RequestQueue相当于一个controller,它是处理请求的核心,所有的请求都在这里中转.
+
+下面是RequestQueue的几个关键变量
+- mSequenceGenerator (AtomicInteger 用于设置Request的mSequence变量,此变量用于优先队列的排列,具体实现可见Request::compareTo方法)
+- mWaitingRequest(等待请求的map)
+- mCurrentRequest(当前正在请求的set)
+- mCacheQueue(缓存的优先队列,用在缓存处理线程中)
+- mNetworkQueue(网络请求队列,用于网络请求队列中)
+- mCache,mNetwork(由构造方法传入)
+- mDelivery(响应传递,默认传入主线程中)
+
+在RequestQueue开始处理到接收请求这段时间中,RequestQueue也做了一些前期的准备工作,具体的步骤如下:
+- 准备好缓存(默认是一个DiskedCache,即基于磁盘的缓存)
+- 准备好Network(Network是一个接口,在其中定义了这样一个方法: `public NetworkResponse performRequest(Request<?> request) throw VolleyError`)
+- 建立一条处理缓存的线程(CacheDispatcher)
+- 建立四条(默认)处理网络请求的线程(NetworkDispatcher)(因为网络请求会阻塞)
+
+产生的请求相当于生产者生产出来的产品,在NetworkDispatcher和CacheDispatcher这两种消费者线上进行消耗.在传统的生产者-消费者模型中,当产能不足或消费不了时,会使相关线程wait一阵子,防止线程阻塞,在这里使用的是通过设置线程优先级来影响线程调度的方法,见代码:
+`android.os.Process.setThreadPriority(Process.THREAD_BACKGROUND)`
+
+准备好这些,我们就可以通过add(Request)方法来生产请求,在add中进行请求的前期处理,逻辑如下:
+- 在mCurrentRequest中加入新的请求
+- 是否使用缓存
+- 否则将请求加入网络请求队列中
+- 是则判断等待队列里是否有相同key的请求
+- 如有则将请求放入等待map中
+- 无则将请求放入缓存处理队列中
+
+下面我们必须了解以下缓存线程和网络请求线程是怎么处理具体请求的:
+
+###CacheDispatcher(缓存线程)
+我们前面说过请求如果默认使用缓存的话最先进入缓存队列,缓存线程就是不停的从缓存队列中取请求并处理,具体的处理流程如下:
+1. 缓存的初始化(如基于磁盘的缓存就是从具体的文件中读入以前的缓存到内存)
+- 从缓存队列中取一个请求
+- 缓存是否命中
+- 未命中则放入网络请求队列中
+- 命中则检查是否过期,过期也将请求放入网络请求队列中
+- 命中且不过期,则由对应Request实现生成响应
+- 使用传递类(默认使用ExecutorDelivery)传递响应至主线程
+
+###NetworkDispatcher
+1. 记录请求到流量消耗(可在ddms观察)
+2. 由Network进行具体的网络请求(后面有详细过程)
+3. 响应码304且已在缓存线程响应完毕的响应不处理
+4. 同CacheDispatcher 6
+5. 判断是否应将响应存入缓存
+6. 同CacheDispatcher 7
+
+###BasicNetwork
+在网络请求线程中的网络请求实际是由Network(BasicNetwork)来进行处理的, 具体的处理逻辑如下:
+1. 加入验证响应新鲜度的头部
+2. 通过HttpStack进行实际的网络请求(这段代码暂不分析,实际上就是构造一个Http请求报文以及对响应进行封装,因为它们涉及http底层类库,有时间会专门分析以加强对http的理解)
+3. 从HttpResponse中得到响应码
+4. 如果是304,则直接使用以前的响应(因为没有改变)
+5. 如果是301,302(重定向),则设置Request的url为redirecturl
+6. 解析响应报文实体为字节数组
+7. 构造一个NetworkResponse(自定义Entity)并返回
+
+-------------
+
+ 下面我们来看一下Volley中对图片对有限支持,使用的话网上已经有很多教程了, 今天只是看一下ImageLoader
+ ImageLoader实际上使用了ImageRequest,说明它也是在RequestQueue中处理的,ImageLoader还留了一个缓存的接口,但是并没有实现缓存(后期我会补上一个内存的图片缓存)
+ ImageLoader有几个重要的变量:
+ - mInFlightRequest(如果此时正在有一个同样的请求在进行中,则将请求合并以节省流量)
+ - mBatchedResponse(保存响应以在获得图片后进行批处理)
+ 
+我们最后看一下实际加载图片(使用get方法)的具体流程
+1. 缓存命中
+2. 直接由ImageListener处理响应
+3. 未命中则在mInFlightRequest中查找是否有相同请求,有则合并
+4. 无则生成一个新的ImageRequest并请求
+5. 根据请求成功与否进行不同的处理
+<!-- markdown end -->
+</div>
+<div class="entry" id="main">
+<!-- content -->
+<p>volley基本构成图
+<img src="http://7xvhgu.com1.z0.glb.clouddn.com/android/image/volley%20constructor.png" alt="volley constructor" title=""></p>
+
+<p>volley请求流程图
+<img src="http://7xvhgu.com1.z0.glb.clouddn.com/android/image/request%20sequence.png" alt="request sequence" title=""></p>
+
+<h3 id="volleyvolleyvolley"><strong>不同于其它volley的分析,我对于volley的分析不是分模块的,而是根据一个请求具体的处理过程来看整个volley的,在读源码时也是采用这种方法,效果也比较好.</strong></h3>
+
+<h2 id="volley">Volley类</h2>
+
+<p>Volley类可以看做是一个工厂类,在其中产出一个符合要求的请求队列,并准备一些基础设施,具体的步骤如下:
+1. 指定缓存目录,默认使用内部存储中的volley文件夹
+2. 指定useragent(包名/版本号),HttpUrlConnection这种请求api使用内置useragent
+3. 指定网络请求使用的基础类库 2.3以下使用HttpClient,2.3及以上使用HttpUrlConnection
+4. 指定请求处理流程类:BasicNetwork
+5. 创建请求队列相关(Cache,Network)
+6. 开始处理</p>
+
+<h2 id="requestqueue">RequestQueue类</h2>
+
+<p>在Volley创建好RequestQueue后,就由RequestQueue处理具体请求.
+RequestQueue相当于一个controller,它是处理请求的核心,所有的请求都在这里中转.</p>
+
+<p>下面是RequestQueue的几个关键变量
+- mSequenceGenerator (AtomicInteger 用于设置Request的mSequence变量,此变量用于优先队列的排列,具体实现可见Request::compareTo方法)
+- mWaitingRequest(等待请求的map)
+- mCurrentRequest(当前正在请求的set)
+- mCacheQueue(缓存的优先队列,用在缓存处理线程中)
+- mNetworkQueue(网络请求队列,用于网络请求队列中)
+- mCache,mNetwork(由构造方法传入)
+- mDelivery(响应传递,默认传入主线程中)</p>
+
+<p>在RequestQueue开始处理到接收请求这段时间中,RequestQueue也做了一些前期的准备工作,具体的步骤如下:
+- 准备好缓存(默认是一个DiskedCache,即基于磁盘的缓存)
+- 准备好Network(Network是一个接口,在其中定义了这样一个方法: <code>public NetworkResponse performRequest(Request&lt;?&gt; request) throw VolleyError</code>)
+- 建立一条处理缓存的线程(CacheDispatcher)
+- 建立四条(默认)处理网络请求的线程(NetworkDispatcher)(因为网络请求会阻塞)</p>
+
+<p>产生的请求相当于生产者生产出来的产品,在NetworkDispatcher和CacheDispatcher这两种消费者线上进行消耗.在传统的生产者-消费者模型中,当产能不足或消费不了时,会使相关线程wait一阵子,防止线程阻塞,在这里使用的是通过设置线程优先级来影响线程调度的方法,见代码:
+<code>android.os.Process.setThreadPriority(Process.THREAD_BACKGROUND)</code></p>
+
+<p>准备好这些,我们就可以通过add(Request)方法来生产请求,在add中进行请求的前期处理,逻辑如下:
+- 在mCurrentRequest中加入新的请求
+- 是否使用缓存
+- 否则将请求加入网络请求队列中
+- 是则判断等待队列里是否有相同key的请求
+- 如有则将请求放入等待map中
+- 无则将请求放入缓存处理队列中</p>
+
+<p>下面我们必须了解以下缓存线程和网络请求线程是怎么处理具体请求的:</p>
+
+<h3 id="cachedispatcher">CacheDispatcher(缓存线程)</h3>
+
+<p>我们前面说过请求如果默认使用缓存的话最先进入缓存队列,缓存线程就是不停的从缓存队列中取请求并处理,具体的处理流程如下:
+1. 缓存的初始化(如基于磁盘的缓存就是从具体的文件中读入以前的缓存到内存)
+- 从缓存队列中取一个请求
+- 缓存是否命中
+- 未命中则放入网络请求队列中
+- 命中则检查是否过期,过期也将请求放入网络请求队列中
+- 命中且不过期,则由对应Request实现生成响应
+- 使用传递类(默认使用ExecutorDelivery)传递响应至主线程</p>
+
+<h3 id="networkdispatcher">NetworkDispatcher</h3>
+
+<ol>
+<li>记录请求到流量消耗(可在ddms观察)</li>
+<li>由Network进行具体的网络请求(后面有详细过程)</li>
+<li>响应码304且已在缓存线程响应完毕的响应不处理</li>
+<li>同CacheDispatcher 6</li>
+<li>判断是否应将响应存入缓存</li>
+<li>同CacheDispatcher 7</li>
+</ol>
+
+<h3 id="basicnetwork">BasicNetwork</h3>
+
+<p>在网络请求线程中的网络请求实际是由Network(BasicNetwork)来进行处理的, 具体的处理逻辑如下:
+1. 加入验证响应新鲜度的头部
+2. 通过HttpStack进行实际的网络请求(这段代码暂不分析,实际上就是构造一个Http请求报文以及对响应进行封装,因为它们涉及http底层类库,有时间会专门分析以加强对http的理解)
+3. 从HttpResponse中得到响应码
+4. 如果是304,则直接使用以前的响应(因为没有改变)
+5. 如果是301,302(重定向),则设置Request的url为redirecturl
+6. 解析响应报文实体为字节数组
+7. 构造一个NetworkResponse(自定义Entity)并返回</p>
+
+<hr>
+
+<p>下面我们来看一下Volley中对图片对有限支持,使用的话网上已经有很多教程了, 今天只是看一下ImageLoader
+ ImageLoader实际上使用了ImageRequest,说明它也是在RequestQueue中处理的,ImageLoader还留了一个缓存的接口,但是并没有实现缓存(后期我会补上一个内存的图片缓存)
+ ImageLoader有几个重要的变量:
+ - mInFlightRequest(如果此时正在有一个同样的请求在进行中,则将请求合并以节省流量)
+ - mBatchedResponse(保存响应以在获得图片后进行批处理)</p>
+
+<p>我们最后看一下实际加载图片(使用get方法)的具体流程
+1. 缓存命中
+2. 直接由ImageListener处理响应
+3. 未命中则在mInFlightRequest中查找是否有相同请求,有则合并
+4. 无则生成一个新的ImageRequest并请求
+5. 根据请求成功与否进行不同的处理</p>
+<!-- content end -->
+</div>
+<br>
+<br>
+    <div id="disqus_thread"></div>
+	<div class="footer">
+		<p>© Copyright 2014 by isnowfy, Designed by isnowfy</p>
+	</div>
+</div>
+<script src="main.js"></script>
+<script id="content" type="text/mustache">
+    <h1>{{title}}</h1>
+    <div class="tag">
+    {{date}}
+    {{#tags}}
+    <a href="/#/tag/{{name}}">#{{name}}</a>
+    {{/tags}}
+    </div>
+</script>
+<script id="pagesTemplate" type="text/mustache">
+    {{#pages}}
+    <li>
+        <a href="{{path}}">{{title}}</a>
+    </li>
+    {{/pages}}
+</script>
+<script>
+$(document).ready(function() {
+    $.ajax({
+        url: "main.json",
+        type: "GET",
+        dataType: "json",
+        success: function(data) {
+            $("#title").html(data.name);
+            var pagesTemplate = Hogan.compile($("#pagesTemplate").html());
+            var pagesHtml = pagesTemplate.render({"pages": data.pages});
+            $("#pages").append(pagesHtml);
+            //path
+            var path = "volley.html";
+            //path end
+            var now = 0;
+            for (var i = 0; i < data.posts.length; ++i)
+                if (path == data.posts[i].path)
+                    now = i;
+            var post = data.posts[now];
+            var tmp = post.tags.split(" ");
+            var tags = [];
+            for (var i = 0; i < tmp.length; ++i)
+                if (tmp[i].length > 0)
+                    tags.push({"name": tmp[i]});
+            var contentTemplate = Hogan.compile($("#content").html());
+            var contentHtml = contentTemplate.render({"title": post.title, "tags": tags, "date": post.date});
+            $("#main").prepend(contentHtml);
+            if (data.disqus_shortname.length > 0) {
+                var disqus_shortname = data.disqus_shortname;
+                (function() {
+                    var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+                    dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+                    (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+                })();
+            }
+        }
+    });
+});
+</script>
+<script src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/x-mathjax-config">
+    MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ["\\(", "\\)"]], processEscapes: true}});
+</script>
+</body>
+</html>
